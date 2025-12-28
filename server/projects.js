@@ -570,9 +570,9 @@ async function getProjects() {
           sessions: []
         };
         
-        // Try to get sessions for this project (increased from 5 to 50 for iOS app)
+        // Try to get sessions for this project (increased to 1000 for iOS app - eliminates SSH workaround)
         try {
-          const sessionResult = await getSessions(entry.name, 50, 0);
+          const sessionResult = await getSessions(entry.name, 1000, 0);
           project.sessions = sessionResult.sessions || [];
           project.sessionMeta = {
             hasMore: sessionResult.hasMore,
