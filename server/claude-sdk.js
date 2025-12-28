@@ -10,15 +10,33 @@
  * - Session management with abort capability
  * - Options mapping between CLI and SDK formats
  * - WebSocket message streaming
+ * - Interactive permission approval via canUseTool callback
  */
 
 import { query } from '@anthropic-ai/claude-agent-sdk';
+import crypto from 'crypto';
 import { promises as fs } from 'fs';
 import path from 'path';
 import os from 'os';
 
 // Session tracking: Map of session IDs to active query instances
 const activeSessions = new Map();
+
+// Permission request tracking: Map of requestId to pending promise resolvers
+const pendingPermissions = new Map();
+
+/**
+ * Creates a deferred promise with external resolve/reject functions
+ * @returns {Object} {promise, resolve, reject}
+ */
+function createDeferredPromise() {
+  let resolve, reject;
+  const promise = new Promise((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
 
 /**
  * Maps CLI options to SDK-compatible options format
@@ -340,6 +358,22 @@ async function loadMcpConfig(cwd) {
 }
 
 /**
+ * Handles a permission response from the client
+ * @param {string} requestId - The request ID from the permission request
+ * @param {string} behavior - 'allow' or 'deny'
+ * @param {boolean} alwaysAllow - Whether to remember this decision for the session
+ */
+function handlePermissionResponse(requestId, behavior, alwaysAllow = false) {
+  const pending = pendingPermissions.get(requestId);
+  if (pending) {
+    console.log(`[PERMISSION] Received response for ${requestId}: ${behavior} (alwaysAllow: ${alwaysAllow})`);
+    pending.resolve({ behavior, alwaysAllow });
+  } else {
+    console.warn(`[PERMISSION] No pending request found for ID: ${requestId}`);
+  }
+}
+
+/**
  * Executes a Claude query using the SDK
  * @param {string} command - User prompt/command
  * @param {Object} options - Query options
@@ -352,6 +386,9 @@ async function queryClaudeSDK(command, options = {}, ws) {
   let sessionCreatedSent = false;
   let tempImagePaths = [];
   let tempDir = null;
+
+  // Track tools that have been always allowed for this session
+  const alwaysAllowedTools = new Set();
 
   try {
     // Map CLI options to SDK format
@@ -368,6 +405,62 @@ async function queryClaudeSDK(command, options = {}, ws) {
     const finalCommand = imageResult.modifiedCommand;
     tempImagePaths = imageResult.tempImagePaths;
     tempDir = imageResult.tempDir;
+
+    // Add canUseTool callback for interactive permission approval
+    // Only add if not in bypassPermissions mode
+    if (sdkOptions.permissionMode !== 'bypassPermissions') {
+      sdkOptions.canUseTool = async (toolName, input) => {
+        // Check if tool has been always allowed for this session
+        if (alwaysAllowedTools.has(toolName)) {
+          console.log(`[PERMISSION] Tool ${toolName} already always-allowed, auto-approving`);
+          return { behavior: 'allow', updatedInput: input };
+        }
+
+        const requestId = crypto.randomUUID();
+        const { promise, resolve } = createDeferredPromise();
+
+        pendingPermissions.set(requestId, { resolve, toolName, input });
+
+        // Send permission request to client
+        console.log(`[PERMISSION] Requesting approval for tool: ${toolName} (requestId: ${requestId})`);
+        ws.send(JSON.stringify({
+          type: 'permission-request',
+          requestId,
+          toolName,
+          input
+        }));
+
+        // Wait for client response with 5 minute timeout
+        try {
+          const response = await Promise.race([
+            promise,
+            new Promise((_, reject) =>
+              setTimeout(() => reject(new Error('Permission request timeout')), 300000)
+            )
+          ]);
+
+          pendingPermissions.delete(requestId);
+
+          // If user selected always allow, remember for this session
+          if (response.behavior === 'allow' && response.alwaysAllow) {
+            alwaysAllowedTools.add(toolName);
+            console.log(`[PERMISSION] Tool ${toolName} added to always-allowed set`);
+          }
+
+          if (response.behavior === 'allow') {
+            console.log(`[PERMISSION] Tool ${toolName} approved by user`);
+            return { behavior: 'allow', updatedInput: input };
+          } else {
+            console.log(`[PERMISSION] Tool ${toolName} denied by user`);
+            return { behavior: 'deny', message: 'User denied permission' };
+          }
+        } catch (error) {
+          pendingPermissions.delete(requestId);
+          console.error(`[PERMISSION] Error waiting for response: ${error.message}`);
+          return { behavior: 'deny', message: error.message };
+        }
+      };
+    }
 
     // Create SDK query instance
     const queryInstance = query({
@@ -525,5 +618,6 @@ export {
   queryClaudeSDK,
   abortClaudeSDKSession,
   isClaudeSDKSessionActive,
-  getActiveClaudeSDKSessions
+  getActiveClaudeSDKSessions,
+  handlePermissionResponse
 };
