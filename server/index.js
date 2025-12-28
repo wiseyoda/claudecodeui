@@ -121,7 +121,45 @@ async function setupProjectsWatcher() {
 
         // Debounce function to prevent excessive notifications
         let debounceTimer;
+        let sessionDebounceTimer;
+
+        // Send lightweight sessions-updated event for session file changes
+        const sendSessionsUpdated = (projectName, sessionId, action) => {
+            const sessionMessage = JSON.stringify({
+                type: 'sessions-updated',
+                projectName: projectName,
+                sessionId: sessionId,
+                action: action, // 'created', 'updated', 'deleted'
+                timestamp: new Date().toISOString()
+            });
+
+            connectedClients.forEach(client => {
+                if (client.readyState === WebSocket.OPEN) {
+                    client.send(sessionMessage);
+                }
+            });
+        };
+
         const debouncedUpdate = async (eventType, filePath) => {
+            const relativePath = path.relative(claudeProjectsPath, filePath);
+            const isSessionFile = relativePath.endsWith('.jsonl');
+
+            // If it's a session file, send a lightweight sessions-updated event
+            if (isSessionFile && !relativePath.startsWith('agent-')) {
+                const parts = relativePath.split(path.sep);
+                if (parts.length >= 2) {
+                    const projectName = parts[0];
+                    const sessionId = path.basename(parts[parts.length - 1], '.jsonl');
+                    const action = eventType === 'unlink' ? 'deleted' :
+                                   eventType === 'add' ? 'created' : 'updated';
+
+                    clearTimeout(sessionDebounceTimer);
+                    sessionDebounceTimer = setTimeout(() => {
+                        sendSessionsUpdated(projectName, sessionId, action);
+                    }, 100); // Faster debounce for session-specific events
+                }
+            }
+
             clearTimeout(debounceTimer);
             debounceTimer = setTimeout(async () => {
                 try {
@@ -138,7 +176,7 @@ async function setupProjectsWatcher() {
                         projects: updatedProjects,
                         timestamp: new Date().toISOString(),
                         changeType: eventType,
-                        changedFile: path.relative(claudeProjectsPath, filePath)
+                        changedFile: relativePath
                     });
 
                     connectedClients.forEach(client => {
