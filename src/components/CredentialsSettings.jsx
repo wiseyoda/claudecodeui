@@ -4,7 +4,7 @@ import { Input } from './ui/input';
 import { Key, Plus, Trash2, Eye, EyeOff, Copy, Check, Github, ExternalLink } from 'lucide-react';
 import { useVersionCheck } from '../hooks/useVersionCheck';
 import { version } from '../../package.json';
-import { authenticatedFetch } from '../utils/api';
+import { authenticatedFetch, BASE_URL } from '../utils/api';
 
 function CredentialsSettings() {
   const [apiKeys, setApiKeys] = useState([]);
@@ -208,7 +208,7 @@ function CredentialsSettings() {
             Generate API keys to access the external API from other applications.
           </p>
           <a
-            href="/api-docs.html"
+            href={`${BASE_URL}/api-docs.html`}
             target="_blank"
             rel="noopener noreferrer"
             className="text-sm text-primary hover:underline inline-flex items-center gap-1"

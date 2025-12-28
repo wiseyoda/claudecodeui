@@ -37,7 +37,7 @@ import { PlanApprovalProvider } from './contexts/PlanApprovalContext';
 import ProtectedRoute from './components/ProtectedRoute';
 import { useVersionCheck } from './hooks/useVersionCheck';
 import useLocalStorage from './hooks/useLocalStorage';
-import { api, authenticatedFetch } from './utils/api';
+import { api, authenticatedFetch, ROUTER_BASENAME } from './utils/api';
 
 
 // Main App component with routing
@@ -994,7 +994,7 @@ function App() {
   return (
     <ThemeProvider>
       <AuthProvider>
-        <Router>
+        <Router basename={ROUTER_BASENAME}>
           <WebSocketProvider>
             <TasksSettingsProvider>
               <TaskMasterProvider>

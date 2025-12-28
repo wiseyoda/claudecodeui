@@ -1,3 +1,17 @@
+// Base path configuration for sub-directory deployments
+// Server injects window.__APP_BASE_PATH__ when serving index.html
+const getBasePath = () => {
+  const basePath = window.__APP_BASE_PATH__ || '';
+  // Normalize: ensure no trailing slash (except for root)
+  if (basePath && basePath !== '/' && basePath.endsWith('/')) {
+    return basePath.slice(0, -1);
+  }
+  return basePath === '/' ? '' : basePath;
+};
+
+export const BASE_URL = getBasePath();
+export const ROUTER_BASENAME = window.__APP_BASE_PATH__ || '/';
+
 // Utility function for authenticated API calls
 export const authenticatedFetch = (url, options = {}) => {
   const isPlatform = import.meta.env.VITE_IS_PLATFORM === 'true';
@@ -14,7 +28,10 @@ export const authenticatedFetch = (url, options = {}) => {
     defaultHeaders['Authorization'] = `Bearer ${token}`;
   }
 
-  return fetch(url, {
+  // Prepend BASE_URL to relative paths for sub-directory deployment support
+  const fullUrl = url.startsWith('/') ? `${BASE_URL}${url}` : url;
+
+  return fetch(fullUrl, {
     ...options,
     headers: {
       ...defaultHeaders,
@@ -27,13 +44,13 @@ export const authenticatedFetch = (url, options = {}) => {
 export const api = {
   // Auth endpoints (no token required)
   auth: {
-    status: () => fetch('/api/auth/status'),
-    login: (username, password) => fetch('/api/auth/login', {
+    status: () => fetch(`${BASE_URL}/api/auth/status`),
+    login: (username, password) => fetch(`${BASE_URL}/api/auth/login`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ username, password }),
     }),
-    register: (username, password) => fetch('/api/auth/register', {
+    register: (username, password) => fetch(`${BASE_URL}/api/auth/register`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ username, password }),

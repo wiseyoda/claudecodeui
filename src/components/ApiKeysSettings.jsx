@@ -2,7 +2,7 @@ import { useState, useEffect } from 'react';
 import { Button } from './ui/button';
 import { Input } from './ui/input';
 import { Key, Plus, Trash2, Eye, EyeOff, Copy, Check, Github } from 'lucide-react';
-import { authenticatedFetch } from '../utils/api';
+import { authenticatedFetch, BASE_URL } from '../utils/api';
 
 function ApiKeysSettings() {
   const [apiKeys, setApiKeys] = useState([]);
@@ -356,7 +356,7 @@ function ApiKeysSettings() {
           Learn how to use the external API to trigger Claude/Cursor sessions from your applications.
         </p>
         <a
-          href="/EXTERNAL_API.md"
+          href={`${BASE_URL}/EXTERNAL_API.md`}
           target="_blank"
           rel="noopener noreferrer"
           className="text-sm text-primary hover:underline"

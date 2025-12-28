@@ -46,6 +46,23 @@ try {
 
 console.log('PORT from env:', process.env.PORT);
 
+// Sub-directory deployment support: normalize APP_BASE_PATH
+// Must start with / and not end with / (except for root)
+const APP_BASE_PATH = (() => {
+    let basePath = process.env.APP_BASE_PATH || '/';
+    // Ensure it starts with /
+    if (!basePath.startsWith('/')) {
+        basePath = '/' + basePath;
+    }
+    // Remove trailing slash (except for root)
+    if (basePath !== '/' && basePath.endsWith('/')) {
+        basePath = basePath.slice(0, -1);
+    }
+    return basePath;
+})();
+
+console.log('APP_BASE_PATH:', APP_BASE_PATH);
+
 import express from 'express';
 import { WebSocketServer, WebSocket } from 'ws';
 import os from 'os';
@@ -755,7 +772,12 @@ wss.on('connection', (ws, request) => {
 
     // Parse URL to get pathname without query parameters
     const urlObj = new URL(url, 'http://localhost');
-    const pathname = urlObj.pathname;
+    let pathname = urlObj.pathname;
+
+    // Strip base path prefix for sub-directory deployments
+    if (APP_BASE_PATH !== '/' && pathname.startsWith(APP_BASE_PATH)) {
+        pathname = pathname.slice(APP_BASE_PATH.length) || '/';
+    }
 
     if (pathname === '/shell') {
         handleShellConnection(ws);
@@ -1689,7 +1711,19 @@ app.get('*', (req, res) => {
     res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
     res.setHeader('Pragma', 'no-cache');
     res.setHeader('Expires', '0');
-    res.sendFile(indexPath);
+
+    // For sub-directory deployments, inject the base path into the HTML
+    if (APP_BASE_PATH !== '/') {
+      let html = fs.readFileSync(indexPath, 'utf8');
+      // Inject window.__APP_BASE_PATH__ before other scripts
+      // Use JSON.stringify for safe escaping
+      const basePathScript = `<script>window.__APP_BASE_PATH__ = ${JSON.stringify(APP_BASE_PATH)};</script>`;
+      html = html.replace('<head>', `<head>\n    ${basePathScript}`);
+      res.setHeader('Content-Type', 'text/html');
+      res.send(html);
+    } else {
+      res.sendFile(indexPath);
+    }
   } else {
     // In development, redirect to Vite dev server only if dist doesn't exist
     res.redirect(`http://localhost:${process.env.VITE_PORT || 5173}`);
