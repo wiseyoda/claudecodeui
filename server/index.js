@@ -742,7 +742,16 @@ function handleChatConnection(ws) {
 
             // Handle permission response messages
             if (data.type === 'permission-response') {
-                console.log('📨 Received permission response from client');
+                console.log('📨 Received permission response from client:', JSON.stringify(data));
+                
+                // First try the legacy canUseTool callback handler (for SDK permission requests)
+                const legacyHandled = handlePermissionResponse(data.requestId, data.decision || data.behavior, data.alwaysAllow || data.decision === 'allow-session');
+                if (legacyHandled) {
+                    console.log('[PERMISSION] Handled by legacy canUseTool callback');
+                    return;
+                }
+                
+                // Fall back to permissionWebSocketHandler for new permission manager
                 const clientId = ws.clientId || `client-${Date.now()}`;
                 permissionWebSocketHandler.handlePermissionResponse(clientId, data);
                 return;

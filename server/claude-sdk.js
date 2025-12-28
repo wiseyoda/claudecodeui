@@ -476,6 +476,7 @@ async function loadMcpConfig(cwd) {
  * @param {boolean} alwaysAllow - Whether to remember this decision for the session
  */
 function handlePermissionResponse(requestId, behavior, alwaysAllow = false) {
+  // Returns true if request was found and handled, false otherwise
   const pending = pendingPermissions.get(requestId);
   if (pending) {
     console.log(`[PERMISSION] Received response for ${requestId}: ${behavior} (alwaysAllow: ${alwaysAllow})`);
