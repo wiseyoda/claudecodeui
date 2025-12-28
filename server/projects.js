@@ -66,6 +66,112 @@ import sqlite3 from 'sqlite3';
 import { open } from 'sqlite';
 import os from 'os';
 
+// ============================================================================
+// SESSION TYPE CLASSIFICATION
+// ============================================================================
+//
+// Session types enable iOS to skip client-side filtering logic.
+// The backend now classifies sessions as:
+//   - 'agent': Task tool spawned sub-sessions (ID starts with 'agent-')
+//   - 'helper': ClaudeHelper sessions for suggestions (deterministic ID or agent)
+//   - 'display': Normal user sessions that should be shown
+//   - 'empty': Sessions with no messages (messageCount === 0)
+//
+// iOS can pass ?type=display to get only displayable sessions.
+// ============================================================================
+
+/**
+ * Generate a deterministic helper session ID for a project path.
+ * Replicates the iOS ClaudeHelper.createHelperSessionId algorithm.
+ * Uses the same hash mixing to produce identical UUIDs.
+ * @param {string} projectPath - The project path
+ * @returns {string} UUID-formatted helper session ID
+ */
+function createHelperSessionId(projectPath) {
+  const data = Buffer.from(projectPath, 'utf8');
+  const hash = new Uint8Array(32);
+
+  // Initialize with non-zero seed values (matches iOS algorithm)
+  for (let i = 0; i < 32; i++) {
+    hash[i] = (i * 17 + 31) & 0xFF;
+  }
+
+  // Mix each byte into the hash (matches iOS algorithm)
+  for (let i = 0; i < data.length; i++) {
+    const positionByte = (i * 37 + 7) & 0xFF;
+    const mixedByte = (data[i] + positionByte) & 0xFF;
+
+    hash[i % 32] = (hash[i % 32] + mixedByte) & 0xFF;
+    hash[(i + 1) % 32] ^= mixedByte;
+    hash[(i + 7) % 32] = (hash[(i + 7) % 32] + (mixedByte >> 3)) & 0xFF;
+    hash[(i + 13) % 32] ^= ((mixedByte << 2) | (mixedByte >> 6)) & 0xFF;
+  }
+
+  // Final mixing pass
+  for (let i = 0; i < 32; i++) {
+    hash[i] = (hash[i] + hash[(i + 17) % 32]) & 0xFF;
+    hash[(i + 5) % 32] ^= hash[i];
+  }
+
+  // Format as UUID v4
+  const hex = (n) => n.toString(16).padStart(2, '0');
+  const part1 = `${hex(hash[0])}${hex(hash[1])}${hex(hash[2])}${hex(hash[3])}`;
+  const part2 = `${hex(hash[4])}${hex(hash[5])}`;
+  const part3 = `4${hex(hash[6])}${(hash[7] & 0x0f).toString(16)}`;
+  const variantNibble = 0x8 | (hash[8] & 0x03);
+  const part4 = `${variantNibble.toString(16)}${hex(hash[9])}${(hash[10] & 0x0f).toString(16)}`;
+  const part5 = `${hex(hash[11])}${hex(hash[12])}${hex(hash[13])}${hex(hash[14])}${hex(hash[15])}${hex(hash[16])}`;
+
+  return `${part1}-${part2}-${part3}-${part4}-${part5}`;
+}
+
+/**
+ * Helper prompt prefixes used to identify helper-generated sessions.
+ * Must match the iOS ClaudeHelper.helperPromptPrefixes.
+ */
+const helperPromptPrefixes = [
+  'Based on this conversation context, suggest',
+  'Based on this conversation, which files',
+  'You are helping a developer expand a quick idea',
+  'Analyze this Claude Code response and suggest'
+];
+
+/**
+ * Check if a message content looks like a ClaudeHelper prompt.
+ * @param {string} content - Message content
+ * @returns {boolean}
+ */
+function isHelperPrompt(content) {
+  if (!content || typeof content !== 'string') return false;
+  return helperPromptPrefixes.some(prefix => content.startsWith(prefix));
+}
+
+/**
+ * Classify a session's type for filtering.
+ * @param {Object} session - Session object with id, lastUserMessage, messageCount
+ * @param {string} projectPath - The project path (for helper ID calculation)
+ * @returns {'agent'|'helper'|'empty'|'display'} Session type
+ */
+function classifySessionType(session, projectPath) {
+  // Agent sessions: ID starts with 'agent-'
+  if (session.id.startsWith('agent-')) {
+    return 'agent';
+  }
+
+  // Helper sessions: matches deterministic helper session ID
+  if (session.id === createHelperSessionId(projectPath)) {
+    return 'helper';
+  }
+
+  // Empty sessions: no messages
+  if (session.messageCount === 0) {
+    return 'empty';
+  }
+
+  // All other sessions are displayable
+  return 'display';
+}
+
 // Import TaskMaster detection functions
 async function detectTaskMasterFolder(projectPath) {
     try {
@@ -701,8 +807,19 @@ async function getProjects() {
   return projects;
 }
 
-async function getSessions(projectName, limit = 5, offset = 0) {
+/**
+ * Get sessions for a project with optional type filtering.
+ * @param {string} projectName - Encoded project name
+ * @param {number} limit - Max sessions to return (default 5)
+ * @param {number} offset - Pagination offset (default 0)
+ * @param {string|null} typeFilter - Filter by session type: 'display', 'agent', 'helper', 'empty', or null for all
+ * @returns {Object} Sessions response with pagination info
+ */
+async function getSessions(projectName, limit = 5, offset = 0, typeFilter = null) {
   const projectDir = path.join(process.env.HOME, '.claude', 'projects', projectName);
+
+  // Get actual project path for helper session ID calculation
+  const projectPath = await extractProjectDirectory(projectName);
 
   try {
     const files = await fs.readdir(projectDir);
@@ -808,20 +925,32 @@ async function getSessions(projectName, limit = 5, offset = 0) {
       }
       return session;
     });
-    const visibleSessions = [...latestFromGroups, ...standaloneSessionsArray]
+    // Add sessionType to each session and apply type filtering
+    const allVisibleSessions = [...latestFromGroups, ...standaloneSessionsArray]
       .filter(session => !session.summary.startsWith('{ "'))
+      .map(session => ({
+        ...session,
+        sessionType: classifySessionType(session, projectPath)
+      }))
       .sort((a, b) => new Date(b.lastActivity) - new Date(a.lastActivity));
 
-    const total = visibleSessions.length;
-    const paginatedSessions = visibleSessions.slice(offset, offset + limit);
+    // Apply type filter if specified
+    const filteredSessions = typeFilter
+      ? allVisibleSessions.filter(session => session.sessionType === typeFilter)
+      : allVisibleSessions;
+
+    const total = filteredSessions.length;
+    const paginatedSessions = filteredSessions.slice(offset, offset + limit);
     const hasMore = offset + limit < total;
-    
+
     return {
       sessions: paginatedSessions,
       hasMore,
       total,
       offset,
-      limit
+      limit,
+      // Include unfiltered total for reference
+      unfilteredTotal: allVisibleSessions.length
     };
   } catch (error) {
     console.error(`Error reading sessions for project ${projectName}:`, error);
@@ -982,6 +1111,51 @@ async function parseJsonlSessions(filePath) {
   }
 }
 
+/**
+ * Extract text content from message content (handles both string and array formats).
+ * This normalizes the various content structures into a simple text string.
+ * @param {Object} entry - JSONL entry with message.content
+ * @returns {string|null} Extracted text content or null
+ */
+function extractTextContent(entry) {
+  if (!entry.message?.content) return null;
+
+  const content = entry.message.content;
+
+  // String format: directly return
+  if (typeof content === 'string') {
+    return content;
+  }
+
+  // Array format: extract text from items
+  if (Array.isArray(content)) {
+    for (const item of content) {
+      if (item.type === 'text' && item.text) {
+        return item.text;
+      }
+      if (item.type === 'thinking' && item.thinking) {
+        return item.thinking;
+      }
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Normalize a message entry by adding a textContent field.
+ * Preserves original structure for backward compatibility.
+ * @param {Object} entry - JSONL entry
+ * @returns {Object} Entry with textContent field added
+ */
+function normalizeMessageEntry(entry) {
+  return {
+    ...entry,
+    // Add pre-extracted text content for easier iOS parsing
+    textContent: extractTextContent(entry)
+  };
+}
+
 // Get messages for a specific session with pagination support
 async function getSessionMessages(projectName, sessionId, limit = null, offset = 0) {
   const projectDir = path.join(process.env.HOME, '.claude', 'projects', projectName);
@@ -1028,18 +1202,21 @@ async function getSessionMessages(projectName, sessionId, limit = null, offset =
     
     const total = sortedMessages.length;
     
+    // Normalize all messages by adding textContent field
+    const normalizedMessages = sortedMessages.map(normalizeMessageEntry);
+
     // If no limit is specified, return all messages (backward compatibility)
     if (limit === null) {
-      return sortedMessages;
+      return normalizedMessages;
     }
-    
+
     // Apply pagination - for recent messages, we need to slice from the end
     // offset 0 should give us the most recent messages
     const startIndex = Math.max(0, total - offset - limit);
     const endIndex = total - offset;
-    const paginatedMessages = sortedMessages.slice(startIndex, endIndex);
+    const paginatedMessages = normalizedMessages.slice(startIndex, endIndex);
     const hasMore = startIndex > 0;
-    
+
     return {
       messages: paginatedMessages,
       total,
@@ -1752,5 +1929,8 @@ export {
   getCodexSessions,
   getCodexSessionMessages,
   deleteCodexSession,
-  smartDecodeProjectPath
+  smartDecodeProjectPath,
+  // Session type classification helpers
+  createHelperSessionId,
+  classifySessionType
 };

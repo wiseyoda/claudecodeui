@@ -233,6 +233,86 @@ const server = http.createServer(app);
 const ptySessionsMap = new Map();
 const PTY_SESSION_TIMEOUT = 30 * 60 * 1000;
 
+// ============================================================================
+// STREAMING BATCHING
+// ============================================================================
+//
+// When a client connects with ?batch=<ms>, messages are accumulated and sent
+// in batches at the specified interval. This reduces view updates on iOS.
+//
+// Message format when batching is enabled:
+//   { type: 'batch', messages: [...array of messages...] }
+//
+// Clients can check for batch messages and process multiple updates at once.
+// ============================================================================
+
+/**
+ * Create a batching wrapper around a WebSocket connection.
+ * Accumulates messages and sends them at specified intervals.
+ * @param {WebSocket} ws - Original WebSocket connection
+ * @param {number} intervalMs - Batch interval in milliseconds
+ * @returns {Object} Wrapped connection with batched send method
+ */
+function createBatchingWrapper(ws, intervalMs) {
+  let buffer = [];
+  let timer = null;
+
+  function flush() {
+    if (buffer.length === 0) return;
+
+    const messages = buffer;
+    buffer = [];
+
+    if (ws.readyState === ws.OPEN) {
+      // Send as batch message containing array of messages
+      ws.send(JSON.stringify({
+        type: 'batch',
+        messages: messages
+      }));
+    }
+  }
+
+  function scheduleFlush() {
+    if (timer) return;
+    timer = setTimeout(() => {
+      timer = null;
+      flush();
+    }, intervalMs);
+  }
+
+  // Return wrapper with same interface as ws
+  return {
+    send: (data) => {
+      // Parse the message to add to buffer
+      try {
+        const message = typeof data === 'string' ? JSON.parse(data) : data;
+        buffer.push(message);
+        scheduleFlush();
+      } catch (e) {
+        // If we can't parse, send immediately
+        if (ws.readyState === ws.OPEN) {
+          ws.send(data);
+        }
+      }
+    },
+    // Forward other properties/methods
+    get readyState() { return ws.readyState; },
+    get OPEN() { return ws.OPEN; },
+    on: ws.on.bind(ws),
+    close: () => {
+      if (timer) clearTimeout(timer);
+      flush(); // Send any remaining messages
+      ws.close();
+    },
+    // Expose original for direct access when needed
+    _original: ws,
+    // Method to flush buffer immediately
+    flush: flush,
+    // Check if batching is enabled
+    isBatching: true
+  };
+}
+
 // Single WebSocket server that handles both paths
 const wss = new WebSocketServer({
     server,
@@ -434,6 +514,9 @@ app.post('/api/system/update', authenticateToken, async (req, res) => {
 app.get('/api/projects', authenticateToken, async (req, res) => {
     try {
         const projects = await getProjects();
+        // Cache for 30 seconds - WebSocket push updates will notify of changes
+        // Private because data is user-specific (based on auth token)
+        res.set('Cache-Control', 'private, max-age=30');
         res.json(projects);
     } catch (error) {
         res.status(500).json({ error: error.message });
@@ -442,8 +525,11 @@ app.get('/api/projects', authenticateToken, async (req, res) => {
 
 app.get('/api/projects/:projectName/sessions', authenticateToken, async (req, res) => {
     try {
-        const { limit = 100, offset = 0 } = req.query;
-        const result = await getSessions(req.params.projectName, parseInt(limit), parseInt(offset));
+        const { limit = 5, offset = 0, type = null } = req.query;
+        // type filter: 'display' for user sessions only, 'agent'/'helper'/'empty' for specific types, null for all
+        const result = await getSessions(req.params.projectName, parseInt(limit), parseInt(offset), type);
+        // Short cache - WebSocket push updates will notify of changes
+        res.set('Cache-Control', 'private, max-age=15');
         res.json(result);
     } catch (error) {
         res.status(500).json({ error: error.message });
@@ -779,10 +865,19 @@ wss.on('connection', (ws, request) => {
         pathname = pathname.slice(APP_BASE_PATH.length) || '/';
     }
 
+    // Check for batching option: ?batch=100 (milliseconds)
+    const batchInterval = urlObj.searchParams.get('batch');
+    let wrappedWs = ws;
+    if (batchInterval && !isNaN(parseInt(batchInterval))) {
+        const intervalMs = Math.max(50, Math.min(1000, parseInt(batchInterval))); // Clamp to 50-1000ms
+        console.log(`[INFO] Batching enabled with ${intervalMs}ms interval`);
+        wrappedWs = createBatchingWrapper(ws, intervalMs);
+    }
+
     if (pathname === '/shell') {
         handleShellConnection(ws);
     } else if (pathname === '/ws') {
-        handleChatConnection(ws);
+        handleChatConnection(wrappedWs, ws); // Pass both wrapped and original
     } else {
         console.log('[WARN] Unknown WebSocket path:', pathname);
         ws.close();
@@ -790,18 +885,26 @@ wss.on('connection', (ws, request) => {
 });
 
 // Handle chat WebSocket connections
-function handleChatConnection(ws) {
-    console.log('[INFO] Chat WebSocket connected');
+// wrappedWs: may be a batching wrapper, used for sending messages
+// originalWs: the actual WebSocket, used for event handling and client tracking
+function handleChatConnection(wrappedWs, originalWs = null) {
+    // Use original ws for events, wrapped for sending
+    const ws = wrappedWs;
+    const eventWs = originalWs || wrappedWs._original || wrappedWs;
 
-    // Add to connected clients for project updates
-    connectedClients.add(ws);
+    console.log('[INFO] Chat WebSocket connected' + (wrappedWs.isBatching ? ' (batching enabled)' : ''));
+
+    // Add original socket to connected clients for project updates
+    connectedClients.add(eventWs);
 
     // Add client to permission WebSocket handler
+    // Use wrapped ws for sending, but track with clientId on original
     const clientId = `client-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
-    ws.clientId = clientId;
-    permissionWebSocketHandler.addClient(ws, clientId);
+    eventWs.clientId = clientId;
+    ws.clientId = clientId; // Also set on wrapper for convenience
+    permissionWebSocketHandler.addClient(eventWs, clientId);
 
-    ws.on('message', async (message) => {
+    eventWs.on('message', async (message) => {
         try {
             const data = JSON.parse(message);
 
@@ -967,10 +1070,12 @@ function handleChatConnection(ws) {
         }
     });
 
-    ws.on('close', () => {
+    eventWs.on('close', () => {
         console.log('🔌 Chat client disconnected');
         // Remove from connected clients
-        connectedClients.delete(ws);
+        connectedClients.delete(eventWs);
+        // Flush any remaining batched messages
+        if (ws.flush) ws.flush();
     });
 }
 
