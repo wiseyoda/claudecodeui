@@ -537,9 +537,11 @@ async function queryClaudeSDK(command, options = {}, ws) {
         console.log(`[PERMISSION] Requesting approval for tool: ${toolName} (requestId: ${requestId})`);
         ws.send(JSON.stringify({
           type: 'permission-request',
-          requestId,
-          toolName,
-          input
+          data: {
+            requestId,
+            toolName,
+            input
+          }
         }));
 
         // Wait for client response with 5 minute timeout
